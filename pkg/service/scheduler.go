@@ -115,7 +115,7 @@ func (s *Scheduler) StartScheduling() error {
 	go s.handleResults()
 
 	// Monitor the database and schedule dial jobs
-	s.monitorDatabase()
+	// s.monitorDatabase()
 
 	// release all resources
 	s.cleanup()
