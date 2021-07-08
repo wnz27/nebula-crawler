@@ -6,65 +6,73 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/dennis-tra/nebula-crawler/pkg/crawl"
 
-	"github.com/dennis-tra/nebula-crawler/pkg/config"
-	"github.com/dennis-tra/nebula-crawler/pkg/db"
-	"github.com/dennis-tra/nebula-crawler/pkg/metrics"
-	"github.com/dennis-tra/nebula-crawler/pkg/models"
+	"github.com/libp2p/go-libp2p-core/peer"
+
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/network"
-	"github.com/libp2p/go-libp2p-core/peer"
-	ma "github.com/multiformats/go-multiaddr"
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-	"go.opencensus.io/stats"
-	"go.opencensus.io/tag"
-	"go.uber.org/atomic"
+
+	"github.com/dennis-tra/nebula-crawler/pkg/config"
+	"github.com/dennis-tra/nebula-crawler/pkg/models"
 )
 
-type Scheduler struct { // Service represents an entity that runs in a
+// knownErrors contains a list of known errors. Property key + string to match for
+var knownErrors = map[string]string{
+	models.FailureTypeIoTimeout:               "i/o timeout",
+	models.FailureTypeConnectionRefused:       "connection refused",
+	models.FailureTypeProtocolNotSupported:    "protocol not supported",
+	models.FailureTypePeerIDMismatch:          "peer id mismatch",
+	models.FailureTypeNoRouteToHost:           "no route to Host",
+	models.FailureTypeNetworkUnreachable:      "network is unreachable",
+	models.FailureTypeNoGoodAddresses:         "no good addresses",
+	models.FailureTypeContextDeadlineExceeded: "context deadline exceeded",
+	models.FailureTypeNoPublicIP:              "no public IP address",
+	models.FailureTypeMaxDialAttemptsExceeded: "max dial attempts exceeded",
+}
+
+type BaseScheduler struct { // Service represents an entity that runs in a
 	// separate go routine and where its lifecycle
 	// needs to be handled externally.
 	*Service
 
 	// The libp2p node that's used to interact with the network. This one is also passed to all workers.
-	host host.Host
+	Host host.Host
 
 	// The database handle
-	dbh *sql.DB
+	Dbh *sql.DB
 
 	// The configuration of timeouts etc.
-	config *config.Config
+	Config *config.Config
 
-	// The queue of peer.AddrInfo's that need to be dialed to.
-	jobQueue chan peer.AddrInfo
+	// The Queue instance acting as a thread safe buffer.
+	Queue *Queue
 
-	// A map from peer.ID to peer.AddrInfo to indicate if a peer was put in the queue, so
+	// A map from peer.ID to peer.AddrInfo to indicate if a peer was put in the Queue, so
 	// we don't put it there again.
 	inJobQueue sync.Map
 
-	// The number of peers in the ping queue.
-	inJobQueueCount atomic.Uint32
-
-	// The queue that the workers publish their dial results on
-	resultsQueue chan interface{}
+	// The Queue that the workers publish their dial results on
+	resultsQueue chan Result
 
 	// The list of worker node references.
 	workers sync.Map
 
-	workerGen NewWorker
+	scheduler Scheduler
 }
 
-type NewWorker func(host.Host, *sql.DB, *config.Config) (Worker, error)
-
-type Worker interface {
-	Start(<-chan peer.AddrInfo, chan<- interface{})
-	Shutdown()
+type Scheduler interface {
+	NewWorker(host.Host, *config.Config) (*BaseWorker, error)
+	Setup() error
+	HandleResult(Result) (*BaseWorker, error)
+	Shutdown() error
 }
 
-func NewScheduler(ctx context.Context, dbh *sql.DB, workerGen NewWorker) (*Scheduler, error) {
+func NewBaseScheduler(ctx context.Context, dbh *sql.DB, scheduler *Scheduler) (*BaseScheduler, error) {
 	conf, err := config.FromContext(ctx)
 	if err != nil {
 		return nil, err
@@ -87,28 +95,32 @@ func NewScheduler(ctx context.Context, dbh *sql.DB, workerGen NewWorker) (*Sched
 		return nil, err
 	}
 
-	m := &Scheduler{
+	m := &BaseScheduler{
 		Service:      New("scheduler"),
-		host:         h,
-		dbh:          dbh,
-		config:       conf,
+		Host:         h,
+		Dbh:          dbh,
+		Config:       conf,
 		inJobQueue:   sync.Map{},
-		jobQueue:     make(chan peer.AddrInfo),
-		resultsQueue: make(chan interface{}),
+		Queue:        NewQueue(),
+		resultsQueue: make(chan Result),
 		workers:      sync.Map{},
-		workerGen:    workerGen,
+		scheduler:    scheduler,
 	}
 
 	return m, nil
 }
 
-func (s *Scheduler) StartScheduling() error {
+func (s *BaseScheduler) StartScheduling() error {
 	s.ServiceStarted()
 	defer s.ServiceStopped()
 
 	// Start all workers
 	if err := s.startWorkers(); err != nil {
 		return errors.Wrap(err, "start workers")
+	}
+
+	if err := s.scheduler.Setup(); err != nil {
+		return errors.Wrap(err, "setup scheduler")
 	}
 
 	// Async handle the results from workers
@@ -121,101 +133,67 @@ func (s *Scheduler) StartScheduling() error {
 	s.cleanup()
 
 	log.WithFields(log.Fields{
-		"inJobQueue":      s.inJobQueueCount.Load(),
+		"inJobQueue":      s.Queue.Length(),
 		"monitorDuration": time.Now().Sub(s.StartTime).String(),
 	}).Infoln("Finished monitoring")
 
 	return nil
 }
 
-func (s *Scheduler) startWorkers() error {
-	for i := 0; i < s.config.MonitorWorkerCount; i++ {
-		w, err := s.workerGen(s.host, s.dbh, s.config)
+func (s *BaseScheduler) startWorkers() error {
+	for i := 0; i < s.Config.MonitorWorkerCount; i++ {
+		w, err := s.scheduler.NewWorker(s.Host, s.Config)
 		if err != nil {
 			return err
 		}
 		s.workers.Store(i, w)
-		go w.Start(s.jobQueue, s.resultsQueue)
+		go w.Start(s.Queue.Consume(), s.resultsQueue)
 	}
 	return nil
 }
 
-func (s *Scheduler) handleResults() {
-	for dr := range s.resultsQueue {
+func (s *BaseScheduler) handleResults() {
+	for result := range s.resultsQueue {
 		logEntry := log.WithFields(log.Fields{
-			"workerID": dr.WorkerID,
-			"targetID": dr.Peer.ID.Pretty()[:16],
-			"alive":    dr.Error == nil,
+			"workerID": result.WorkerID,
+			"targetID": result.PeerIDPretty(),
+			"alive":    result.Error == nil,
 		})
-		if dr.Error != nil {
-			logEntry = logEntry.WithError(dr.Error)
+		if result.Error != nil {
+			logEntry = logEntry.WithError(result.Error())
 		}
-		logEntry.Infoln("Handling dial result from worker", dr.WorkerID)
+		logEntry.Infoln("Handling result from worker", result.WorkerID)
 
 		// Update maps
-		s.inJobQueue.Delete(dr.Peer.ID)
-		stats.Record(s.ServiceContext(), metrics.PeersToDialCount.M(float64(s.inJobQueueCount.Dec())))
+		s.inJobQueue.Delete(result.PeerID())
 
-		errKey := "unknown"
-		for key, errStr := range knownErrors {
-			if strings.Contains(dr.Error.Error(), errStr) {
-				errKey = key
-				break
-			}
-		}
+		s.scheduler.HandleResult(result)
 
-		if ctx, err := tag.New(s.ServiceContext(), tag.Upsert(metrics.KeyError, errKey)); err == nil {
-			stats.Record(ctx, metrics.PeersToDialErrorsCount.M(1))
-		}
-
-		var err error
-		if dr.Error == nil {
-			err = db.UpsertSessionSuccess(s.dbh, dr.Peer.ID.Pretty())
-		} else {
-			err = db.UpsertSessionErrorTS(s.dbh, dr.Peer.ID.Pretty(), dr.FirstFailedDial)
-		}
-
-		if err != nil {
-			logEntry.WithError(err).Warn("Could not update session record")
-		}
+		logEntry.WithFields(map[string]interface{}{
+			"inCrawlQueue": s.Queue.Length(),
+			"crawled":      len(s.crawled),
+		}).Infoln("Handled crawl result from worker", cr.WorkerID)
 	}
 }
 
-func (s *Scheduler) EnqueueJob(pi peer.AddrInfo) {
-	// Schedule job for peer
-	go func() {
-		if s.IsStarted() {
-			s.jobQueue <- pi
-		}
-	}()
+func (s *BaseScheduler) ScheduleJob(pi peer.AddrInfo) {
+	s.inJobQueue.Store(pi.ID, pi)
+	s.Queue.push(&pi)
 }
 
-func (s *Scheduler) cleanup() {
-	s.drainJobQueue()
-	close(s.jobQueue)
+func (s *BaseScheduler) cleanup() {
+	s.Queue.Close()
 	s.shutdownWorkers()
 	close(s.resultsQueue)
 }
 
-// drainJobQueue reads all entries from crawlQueue and discards them.
-func (s *Scheduler) drainJobQueue() {
-	for {
-		select {
-		case pi := <-s.jobQueue:
-			log.WithField("targetID", pi.ID.Pretty()[:16]).Debugln("Drained peer")
-		default:
-			return
-		}
-	}
-}
-
 // shutdownWorkers sends shutdown signals to all workers and blocks until all have shut down.
-func (s *Scheduler) shutdownWorkers() {
+func (s *BaseScheduler) shutdownWorkers() {
 	var wg sync.WaitGroup
 	s.workers.Range(func(_, worker interface{}) bool {
-		w := worker.(Worker)
+		w := worker.(BaseWorker)
 		wg.Add(1)
-		go func(w Worker) {
+		go func(w BaseWorker) {
 			w.Shutdown()
 			wg.Done()
 		}(w)

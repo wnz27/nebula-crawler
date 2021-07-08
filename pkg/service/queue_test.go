@@ -1,8 +1,10 @@
-package queue
+package service
 
 import (
 	"sync"
 	"testing"
+
+	"github.com/libp2p/go-libp2p-core/peer"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -17,9 +19,9 @@ func TestNewBuffer(t *testing.T) {
 
 func TestQueue_Push_simple(t *testing.T) {
 	b := NewQueue()
-	b.Schedule(0)
-	b.Schedule(1)
-	b.Schedule(2)
+	b.Schedule(&peer.AddrInfo{ID: peer.ID(0)})
+	b.Schedule(&peer.AddrInfo{ID: peer.ID(1)})
+	b.Schedule(&peer.AddrInfo{ID: peer.ID(2)})
 
 	i := 0
 	for elem := range b.out {
@@ -39,13 +41,13 @@ func TestQueue_Push_concurrent(t *testing.T) {
 	count := 10000
 	go func() {
 		for i := 0; i < count; i++ {
-			b.Schedule(i)
+			b.Schedule(&peer.AddrInfo{ID: peer.ID(i)})
 		}
 		wg.Done()
 	}()
 	go func() {
 		for i := 0; i < count; i++ {
-			b.Schedule(i)
+			b.Schedule(&peer.AddrInfo{ID: peer.ID(i)})
 		}
 		wg.Done()
 	}()

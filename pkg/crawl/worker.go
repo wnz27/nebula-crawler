@@ -17,7 +17,6 @@ import (
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"go.opencensus.io/stats"
-	"go.uber.org/atomic"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/dennis-tra/nebula-crawler/pkg/config"
@@ -25,14 +24,9 @@ import (
 	"github.com/dennis-tra/nebula-crawler/pkg/service"
 )
 
-var workerID = atomic.NewInt32(0)
-
 // Result captures data that is gathered from crawling a single peer.
 type Result struct {
-	WorkerID string
-
-	// The crawled peer
-	Peer peer.AddrInfo
+	*service.BaseResult
 
 	// The neighbors of the crawled peer
 	Neighbors []peer.AddrInfo
@@ -42,14 +36,11 @@ type Result struct {
 
 	// The protocols the peer supports
 	Protocols []string
-
-	// Any error that has occurred during the crawl
-	Error error
 }
 
 // Worker encapsulates a libp2p host that crawls the network.
 type Worker struct {
-	*service.Service
+	*service.BaseWorker
 
 	host         host.Host
 	config       *config.Config
@@ -70,70 +61,46 @@ func NewWorker(h host.Host, conf *config.Config) (*Worker, error) {
 		return nil, err
 	}
 
-	c := &Worker{
-		Service: service.New(fmt.Sprintf("worker-%02d", workerID.Load())),
-		host:    h,
-		pm:      pm,
-		config:  conf,
+	w := &Worker{
+		host:   h,
+		pm:     pm,
+		config: conf,
 	}
-	workerID.Inc()
 
-	return c, nil
+	w.BaseWorker = service.NewBaseWorker(w)
+
+	return w, nil
 }
 
-// StartCrawling reads from the given crawl queue and publishes the results on the results queue until interrupted.
-func (w *Worker) StartCrawling(crawlQueue chan peer.AddrInfo, resultsQueue chan Result) {
-	w.ServiceStarted()
-	defer w.ServiceStopped()
-	defer log.Debugf("Worker %s crawled %d peers\n", w.Identifier(), w.crawledPeers)
-
-	ctx := w.ServiceContext()
-	for pi := range crawlQueue {
-		logEntry := log.WithField("targetID", pi.ID.Pretty()[:16]).WithField("workerID", w.Identifier())
-		logEntry.Debugln("Crawling peer ", pi.ID.Pretty()[:16])
-
-		cr := w.crawlPeer(ctx, pi)
-
-		select {
-		case resultsQueue <- cr:
-		case <-w.SigShutdown():
-			return
-		}
-
-		logEntry.Debugln("Crawled peer ", pi.ID.Pretty()[:16])
-	}
-}
-
-func (w *Worker) crawlPeer(ctx context.Context, pi peer.AddrInfo) Result {
+func (w *Worker) HandleJob(ctx context.Context, pi peer.AddrInfo) service.Result {
 	start := time.Now()
 	defer stats.Record(ctx, metrics.PeerCrawlDuration.M(millisSince(start)))
 
-	cr := Result{
-		WorkerID: w.Identifier(),
-		Peer:     filterPrivateMaddrs(pi),
-		Agent:    "n.a.",
+	res := &Result{
+		BaseResult: service.NewBaseResult(w.BaseWorker.Identifier(), pi),
+		Agent:      "n.a.",
 	}
 
-	cr.Error = w.connect(ctx, pi)
-	if cr.Error == nil {
+	res.Err = w.connect(ctx, pi)
+	if res.Err == nil {
 
 		ps := w.host.Peerstore()
 
 		// Extract agent
-		if agent, err := ps.Get(pi.ID, "AgentVersion"); err == nil {
-			cr.Agent = agent.(string)
+		if agent, err := ps.Get(pi.ID, "agentVersion"); err == nil {
+			res.Agent = agent.(string)
 		}
 
 		// Extract protocols
 		if protocols, err := ps.GetProtocols(pi.ID); err == nil {
-			cr.Protocols = protocols
+			res.Protocols = protocols
 		}
 
 		// Fetch all neighbors
 		timeoutCtx, cancel := context.WithTimeout(ctx, network.DialPeerTimeout)
 		defer cancel()
 
-		cr.Neighbors, cr.Error = w.fetchNeighbors(timeoutCtx, pi)
+		res.Neighbors, res.Err = w.fetchNeighbors(timeoutCtx, pi)
 	}
 
 	if err := w.host.Network().ClosePeer(pi.ID); err != nil {
@@ -142,12 +109,7 @@ func (w *Worker) crawlPeer(ctx context.Context, pi peer.AddrInfo) Result {
 
 	w.crawledPeers++
 
-	return cr
-}
-
-// millisSince returns the number of milliseconds between now and the given time.
-func millisSince(start time.Time) float64 {
-	return float64(time.Since(start)) / float64(time.Millisecond)
+	return res
 }
 
 // connect strips all private multi addresses in `pi` and establishes a connection to the given peer.
@@ -234,4 +196,9 @@ func filterPrivateMaddrs(pi peer.AddrInfo) peer.AddrInfo {
 	}
 
 	return filtered
+}
+
+// millisSince returns the number of milliseconds between now and the given time.
+func millisSince(start time.Time) float64 {
+	return float64(time.Since(start)) / float64(time.Millisecond)
 }

@@ -57,20 +57,6 @@ type Scheduler struct { // Service represents an entity that runs in a
 	workers sync.Map
 }
 
-// knownErrors contains a list of known errors. Property key + string to match for
-var knownErrors = map[string]string{
-	"io_timeout":                 "i/o timeout",
-	"connection_refused":         "connection refused",
-	"protocol_not_supported":     "protocol not supported",
-	"peer_id_mismatch":           "peer id mismatch",
-	"no_route_to_host":           "no route to host",
-	"network_unreachable":        "network is unreachable",
-	"no_good_addresses":          "no good addresses",
-	"context_deadline_exceeded":  "context deadline exceeded",
-	"no_public_ip":               "no public IP address",
-	"max_dial_attempts_exceeded": "max dial attempts exceeded",
-}
-
 func NewScheduler(ctx context.Context, dbh *sql.DB) (*Scheduler, error) {
 	conf, err := config.FromContext(ctx)
 	if err != nil {
@@ -157,23 +143,23 @@ func (s *Scheduler) handleResults() {
 		s.inDialQueue.Delete(dr.Peer.ID)
 		stats.Record(s.ServiceContext(), metrics.PeersToDialCount.M(float64(s.inDialQueueCount.Dec())))
 
-		errKey := "unknown"
-		for key, errStr := range knownErrors {
-			if strings.Contains(dr.Error.Error(), errStr) {
-				errKey = key
-				break
-			}
-		}
-
-		if ctx, err := tag.New(s.ServiceContext(), tag.Upsert(metrics.KeyError, errKey)); err == nil {
-			stats.Record(ctx, metrics.PeersToDialErrorsCount.M(1))
-		}
-
 		var err error
 		if dr.Error == nil {
 			err = db.UpsertSessionSuccess(s.dbh, dr.Peer.ID.Pretty())
 		} else {
 			err = db.UpsertSessionErrorTS(s.dbh, dr.Peer.ID.Pretty(), dr.FirstFailedDial)
+
+			errKey := models.FailureTypeUnknown
+			for key, errStr := range knownErrors {
+				if strings.Contains(dr.Error.Error(), errStr) {
+					errKey = key
+					break
+				}
+			}
+
+			if ctx, err := tag.New(s.ServiceContext(), tag.Upsert(metrics.KeyError, errKey)); err == nil {
+				stats.Record(ctx, metrics.PeersToDialErrorsCount.M(1))
+			}
 		}
 
 		if err != nil {
