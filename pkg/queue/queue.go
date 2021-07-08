@@ -1,102 +1,144 @@
 package queue
 
+// resize logic taken from
+
 import (
 	"sync"
 )
 
-// Buffer exposes an API that allows sending events/jobs/items on a go channel that won't block. On the other side
-// it exposes a channel that can be read which allows consuming these event. This buffer is an unbound FIFO queue.
-type Buffer struct {
-	wg     sync.WaitGroup
-	lk     sync.RWMutex
-	queue  []interface{}
-	in     chan interface{}
+const minLen = 16
+
+// Queue exposes an API that allows sending events/jobs/items on a go channel that won't block. On the other side
+// it exposes a channel that can be read which allows consuming these event. This buffer is an unbound FIFO buf.
+type Queue struct {
+	wg sync.WaitGroup
+
+	lk    sync.RWMutex
+	buf   []interface{}
+	tail  int
+	head  int
+	count int
+
 	out    chan interface{}
 	notify chan struct{}
 	stop   chan struct{}
 }
 
-func NewBuffer() *Buffer {
-	b := &Buffer{
-		queue:  make([]interface{}, 0),
-		in:     make(chan interface{}),
+func NewQueue() *Queue {
+	q := &Queue{
+		buf:    make([]interface{}, minLen),
 		out:    make(chan interface{}),
 		notify: make(chan struct{}),
 		stop:   make(chan struct{}),
 	}
 
-	b.wg.Add(2)
+	q.wg.Add(1)
 
-	go b.read()
-	go b.write()
+	go q.write()
 
-	return b
+	return q
 }
 
-// read reads from the in channel and enqueues the items in the local buffer. It also notifies the writer go routine
-// about new items if it isn't busy at the moment.
-func (b *Buffer) read() {
-	defer b.wg.Done()
-	for in := range b.in {
-		b.enqueue(in)
-		b.notifyWriter()
+// push puts an element at the end of the queue.
+// Adapted from: https://github.com/eapache/queue/blob/master/queue.go
+func (q *Queue) push(in interface{}) {
+	q.lk.Lock()
+	defer q.lk.Unlock()
+
+	if q.count == len(q.buf) {
+		q.resize()
 	}
+
+	q.buf[q.tail] = in
+	// bitwise modulus
+	q.tail = (q.tail + 1) & (len(q.buf) - 1)
+	q.count++
 }
 
-// enqueue just puts the item in the slice in a thread safe way.
-func (b *Buffer) enqueue(in interface{}) {
-	b.lk.Lock()
-	defer b.lk.Unlock()
-	b.queue = append(b.queue, in)
+// pop removes and returns the element from the front of the queue. It returns nil if the queue is empty
+// Adapted from: https://github.com/eapache/queue/blob/master/queue.go
+func (q *Queue) pop() interface{} {
+	q.lk.Lock()
+	defer q.lk.Unlock()
+
+	if q.count <= 0 {
+		return nil
+	}
+	ret := q.buf[q.head]
+	q.buf[q.head] = nil
+
+	// bitwise modulus
+	q.head = (q.head + 1) & (len(q.buf) - 1)
+	q.count--
+
+	// Resize down if buffer 1/4 full.
+	if len(q.buf) > minLen && (q.count<<2) == len(q.buf) {
+		q.resize()
+	}
+	return ret
+}
+
+// resizes the queue to fit exactly twice its current contents
+// this can result in shrinking if the queue is less than half-full
+// Adapted from: https://github.com/eapache/queue/blob/master/queue.go
+func (q *Queue) resize() {
+	newBuf := make([]interface{}, q.count<<1)
+
+	if q.tail > q.head {
+		copy(newBuf, q.buf[q.head:q.tail])
+	} else {
+		n := copy(newBuf, q.buf[q.head:])
+		copy(newBuf[n:], q.buf[:q.tail])
+	}
+
+	q.head = 0
+	q.tail = q.count
+	q.buf = newBuf
 }
 
 // notifyWriter notifies the writer go routine that there are new items to be written to the consumers in a non-blocking way.
-func (b *Buffer) notifyWriter() {
+func (q *Queue) notifyWriter() {
 	select {
-	case b.notify <- struct{}{}:
+	case q.notify <- struct{}{}:
 	default:
 	}
 }
 
-// write drains the queue of elements and sends them to the out channel. If there are no elements anymore it waits
+// write drains the buf of elements and sends them to the out channel. If there are no elements anymore it waits
 // until notified.
-func (b *Buffer) write() {
-	defer b.wg.Done()
+func (q *Queue) write() {
+	defer q.wg.Done()
 	for {
-		b.lk.Lock()
-		if len(b.queue) > 0 {
-			item := b.queue[0]
-			b.queue = b.queue[1:]
-			b.lk.Unlock()
-			b.out <- item
+		if item := q.pop(); item != nil {
+			select {
+			case q.out <- item:
+			case <-q.stop:
+				return
+			}
 			continue
 		}
-		b.lk.Unlock()
 
 		select {
-		case <-b.notify:
-		case <-b.stop:
+		case <-q.notify:
+		case <-q.stop:
 			return
 		}
 	}
 }
 
 // Close stops all go routines in a blocking way
-func (b *Buffer) Close() {
-	close(b.stop)
-	close(b.in)
-	b.wg.Wait()
-	close(b.out)
+func (q *Queue) Close() {
+	close(q.stop)
+	q.wg.Wait()
+	close(q.out)
 }
 
-func (b *Buffer) Push(elem interface{}) {
-	b.in <- elem
+func (q *Queue) Consume() <-chan interface{} {
+	return q.out
 }
 
-func (b *Buffer) Schedule() chan<- interface{} {
-	return b.in
-}
-
-func (b *Buffer) Consume() <-chan interface{} {
-	return b.out
+// Schedule pushes the item onto the queue and notifies the writer that there are new items to be published.
+func (q *Queue) Schedule(item interface{}) {
+	q.push(item)
+	q.notifyWriter()
 }
