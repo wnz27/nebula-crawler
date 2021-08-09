@@ -19,7 +19,7 @@ import (
 func setup(t *testing.T) (context.Context, *sql.DB, string, func(*testing.T)) {
 	ctx := context.Background()
 
-	db, err := sql.Open("postgres", "dbname=nebula user=nebula password=password sslmode=disable")
+	db, err := sql.Open("postgres", "dbname=nebula user=nebuladev password=nebula123 sslmode=disable")
 	require.NoError(t, err)
 
 	peerID := fmt.Sprintf("some-id-%d", time.Now().UnixNano())

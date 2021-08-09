@@ -7,10 +7,10 @@ datasources:
  - name: Nebula Postgres
    type: postgres
    url: postgres:5432
-   user: nebula
+   user: nebuladev
    database: nebula
    jsonData:
      sslmode: disable
      postgresVersion: 12
    secureJsonData:
-     password: password # TODO: unsafe
+     password: nebula123 # TODO: unsafe

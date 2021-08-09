@@ -10,8 +10,8 @@ services:
       NEBULA_DATABASE_HOST: postgres
       NEBULA_DATABASE_PORT: 5432
       NEBULA_DATABASE_NAME: nebula
-      NEBULA_DATABASE_USER: nebula
-      NEBULA_DATABASE_PASSWORD: password # TODO: unsafe
+      NEBULA_DATABASE_USER: nebuladev
+      NEBULA_DATABASE_PASSWORD: nebula123 # TODO: unsafe
     depends_on:
       postgres:
         condition: service_healthy
@@ -32,8 +32,8 @@ services:
       timeout: 5s
       retries: 20
     environment:
-      POSTGRES_PASSWORD: password # TODO: unsafe
-      POSTGRES_USER: nebula
+      POSTGRES_PASSWORD: nebula123 # TODO: unsafe
+      POSTGRES_USER: nebuladev
       POSTGRES_DB: nebula
     networks:
       nebula:
